@@ -55,18 +55,6 @@ make fmt         # gofmt
 GINKGO_ARGS="-v --focus='your test pattern'" make unit
 ```
 
-# Run e2e tests (requires deployed operator)
-KUBECONFIG=/path/to/cluster/kubeconfig NAMESPACE=openshift-multiarch-tuning-operator make e2e
-
-# Generate manifests after API changes
-make manifests
-
-# Update vendored dependencies
-make vendor
-
-# Verify no uncommitted changes in working tree
-make verify-diff
-```
 
 ### Deployment Commands
 ```shell
@@ -96,14 +84,19 @@ make undeploy
 # Uninstall CRDs
 make uninstall
 ```
-### API Changes
-
+### API Changes and Maintenance
 ```bash
 # Generate manifests (CRDs, RBAC, etc.) after editing API definitions
 make manifests
 
 # Generate DeepCopy implementations
 make generate
+
+# Update vendored dependencies
+make vendor
+
+# Verify no uncommitted changes in working tree
+make verify-diff
 ```
 
 ### Bundle and Catalog Commands
@@ -170,19 +163,7 @@ Only one mode can be active at a time. Each mode has its own leader election ID.
 - Uses caching to optimize repeated inspections
 - Metrics tracking for inspection operations
 
-### Execution Modes
-
-The operator binary runs in four mutually exclusive modes (controlled by flags in main.go):
-
-1. **Operator Mode** (`--enable-operator`): Manages the ClusterPodPlacementConfig CR lifecycle. Deploys and manages the pod placement operand components (controller and webhook deployments).
-
-2. **Pod Placement Controller Mode** (`--enable-ppc-controllers`): Reconciles pods with the scheduling gate, inspects container images to determine supported architectures, sets nodeAffinity requirements, and removes the scheduling gate.
-
-3. **Pod Placement Webhook Mode** (`--enable-ppc-webhook`): Mutating webhook that adds the scheduling gate to new pods (except in excluded namespaces).
-
-4. **ENoExecEvent Controllers Mode** (`--enable-enoexec-event-controllers`): Monitors and handles exec format errors detected by the eBPF-based daemon running on cluster nodes.
-
-### Key Components
+### Implementation Details
 
 **Operator Controller** (`internal/controller/operator/clusterpodplacementconfig_controller.go`):
 - Reconciles ClusterPodPlacementConfig singleton resource (name must be "cluster")
@@ -266,6 +247,10 @@ Additionally, pods are always skipped if they:
 ## Code Organization
 
 ```
+cmd/
+├── main.go              # Main operator binary (all modes)
+└── enoexec-daemon/      # eBPF daemon for exec format error monitoring
+
 api/
 ├── common/              # Shared constants and types
 │   └── plugins/         # Plugin system (NodeAffinityScoring)
@@ -274,14 +259,16 @@ api/
 
 internal/controller/
 ├── operator/            # Operator mode: ClusterPodPlacementConfig lifecycle
-└── podplacement/        # Operand modes: pod reconciler and webhook
-    └── metrics/         # Prometheus metrics
+├── podplacement/        # Operand modes: pod reconciler and webhook
+│   └── metrics/         # Prometheus metrics
+├── podplacementconfig/  # PodPlacementConfig controller
+└── enoexecevent/        # ENoExecEvent handler controller
 
 pkg/
 ├── e2e/                 # E2E test utilities
 ├── image/               # Container image inspection and authentication
 ├── informers/           # CPPC singleton informer
-├── testing/             # Test helpers
+├── testing/             # Test helpers (builder/, framework/, image/, registry/)
 └── utils/               # Shared utilities
 
 config/                  # Kustomize configurations
@@ -301,14 +288,6 @@ hack/                    # Build and test scripts
 - Located in pkg/e2e/
 - Require deployed operator in cluster
 - Separate test suites for operator and pod placement
-
-## Environment Variables
-
-Create a `.env` file in the repository root to customize build settings:
-- `NO_DOCKER=1`: Run builds/tests locally instead of in container
-- `FORCE_DOCKER=1`: Force Docker instead of Podman
-- `BUILD_IMAGE`: Override builder image
-- `RUNTIME_IMAGE`: Override runtime base image
 
 ## Important Implementation Notes
 
