@@ -3,211 +3,214 @@
 ## Repository Layout
 
 ```text
-api/
-├── common/              # Shared constants (verbosity levels) and plugin types
-│   └── plugins/         # Plugin definitions (NodeAffinityScoring, CelArchitecturePlacement, ExecFormatErrorMonitor)
-├── v1alpha1/            # Alpha API — conversion to/from v1beta1 hub
-└── v1beta1/             # Beta API — storage version (ClusterPodPlacementConfig, PodPlacementConfig, ENoExecEvent)
-
 cmd/
-├── main.go              # Entrypoint — four mutually exclusive modes via --enable-* flags
-└── enoexec-daemon/      # Separate binary for eBPF-based exec format error monitoring on nodes
+├── main.go                          # Single binary entrypoint; flag-driven mode selection
+└── enoexec-daemon/main.go           # Separate eBPF daemon binary (deployed as DaemonSet)
+
+api/
+├── common/                          # Shared constants (LogVerbosity), labels, plugins interface
+│   └── plugins/                     # Plugin types: NodeAffinityScoring, CEL ArchitectureRule
+├── v1alpha1/                        # Alpha API version with conversion to v1beta1
+└── v1beta1/                         # Storage version — ClusterPodPlacementConfig, PodPlacementConfig types
 
 internal/controller/
-├── operator/            # Operator mode: CPPC lifecycle, operand deployment, resource building
-│   ├── podplacement_objects.go   # Build functions for webhook, controller deployments, RBAC
-│   ├── enoexecevent_objects.go   # Build functions for enoexec DaemonSet, handler, alerts
-│   └── objects.go                # Shared build helpers (Service, Deployment, ClusterRole, ServiceMonitor)
-├── podplacement/        # Operand mode: pod reconciler, webhook, image inspection, CEL evaluator
-│   ├── pod_model.go              # Core pod processing logic (700 lines) — shouldIgnorePod, affinity, gates
-│   ├── cel_evaluator.go          # CEL expression compilation and caching (LRU, 1024 entries)
-│   └── metrics/                  # Prometheus metrics for controller and webhook
-├── podplacementconfig/  # PodPlacementConfig controller (namespaced, stub — TODO in reconciler)
+├── operator/                        # Operator mode: reconciles CPPC, deploys operand resources
+│   ├── objects.go                   # Resource builders (Deployment, Service, RBAC, webhook)
+│   ├── podplacement_objects.go      # Pod placement operand resource definitions
+│   └── enoexecevent_objects.go      # ENoExec operand resource definitions
+├── podplacement/                    # Operand: pod reconciler, webhook, CEL evaluator
+│   ├── pod_reconciler.go            # Watches gated Pending pods, inspects images, sets nodeAffinity
+│   ├── scheduling_gate_mutating_webhook.go  # Adds scheduling gate to new pods
+│   ├── pod_model.go                 # Core pod processing logic and image architecture detection
+│   ├── cel_evaluator.go             # CEL expression compilation/caching/evaluation
+│   ├── cel_integration.go           # Integrates PodPlacementConfig CEL rules into reconciler
+│   ├── architecture_application.go  # In-place nodeAffinity mutation for architecture constraints
+│   ├── architecture_removal.go      # Removes architecture constraints from nodeSelector/affinity
+│   ├── global_pull_secret.go        # GlobalPullSecretSyncer runnable
+│   └── metrics/                     # Prometheus metric definitions
+├── podplacementconfig/              # PodPlacementConfig validation webhook
 └── enoexecevent/
-    ├── daemon/          # eBPF tracepoint monitoring daemon (runs as DaemonSet on nodes)
-    └── handler/         # ENoExecEvent CR handler (creates events on affected pods)
+    ├── daemon/                      # eBPF-based exec format error monitor (separate binary)
+    └── handler/                     # ENoExecEvent CR reconciler
 
 pkg/
-├── image/               # Container image inspection — manifest fetching, auth, caching
-├── informers/           # ClusterPodPlacementConfig singleton informer (runtime config access)
-├── models/              # Shared pod model (gate management, label helpers)
-├── testing/             # Test utilities — fluent builders (builder/), framework helpers (framework/)
-└── utils/               # Constants, resource apply/delete, runtime helpers
-    ├── const.go          # ALL label keys, annotation keys, scheduling gate name, component names
-    └── resource.go       # ApplyResource/ApplyResources — library-go resourceapply dispatcher
+├── image/                           # Container image inspection (containers/image library, CGO)
+│   ├── inspector.go                 # Registry manifest retrieval, architecture detection, caching
+│   └── metrics/                     # Image inspection metrics
+├── informers/clusterpodplacementconfig/  # CPPC singleton informer (runtime config access)
+├── utils/                           # Constants, resourceapply dispatcher, namespace/image resolution
+│   ├── const.go                     # Labels, finalizers, scheduling gate name, arch constants
+│   ├── resource.go                  # ApplyResource — library-go resourceapply type switch
+│   └── runtime.go                   # Namespace(), Image() from env vars
+├── testing/                         # Test helpers: builders, framework, fake registry
+│   ├── builder/                     # Fluent builders for K8s objects in tests
+│   ├── framework/                   # Shared test utilities (envtest setup, cluster version)
+│   └── image/fake/                  # Fake container registry for unit tests
+├── models/                          # Shared data models
+└── e2e/                             # E2E test suites (operator, podplacement, podplacementconfig)
 
-config/                  # Kustomize overlays (CRDs, RBAC, webhook, default, manager)
-bundle/                  # OLM bundle (CSV, CRDs, RBAC manifests)
-hack/                    # Build/test scripts (CI, version bumping, snapshot checks)
-deploy/                  # Deployment manifests (OCP-specific)
-test/manifests/          # Test fixture manifests
-docs/                    # Operational docs (metrics, OCP release process, alerts, enhancements)
+config/                              # Kustomize overlays (default, crd, rbac, webhook, certmanager)
+bundle/                              # OLM bundle (CSV, CRDs, RBAC manifests)
+deploy/                              # Deployment templates
+hack/                                # Build scripts, CI helpers
+docs/                                # Repo docs: metrics, alerts, enhancements, release process
 ```
 
 ## Key Domain Concepts
 
-The Multiarch Tuning Operator (MTO) solves a single problem: in clusters with nodes of different CPU architectures (amd64, arm64, ppc64le, s390x), pods must only be scheduled on nodes whose architecture matches the container images they run.
+The Multiarch Tuning Operator solves the problem of scheduling pods onto nodes with compatible CPU architectures in heterogeneous clusters. The core abstraction is the **scheduling gate**: a Kubernetes mechanism (KEP-3521) that prevents a pod from being scheduled until it is explicitly ungated.
 
-**Primary workflow — Pod Placement:**
+**Primary workflow** — Pod Placement:
 1. User creates a `ClusterPodPlacementConfig` singleton CR (name must be `"cluster"`)
-2. Operator controller deploys the pod placement operand (controller + webhook deployments)
-3. Webhook intercepts pod creation and adds the `multiarch.openshift.io/scheduling-gate` scheduling gate
-4. Pod reconciler watches gated pods, inspects container images to determine supported architectures
-5. Reconciler sets `nodeAffinity` for `kubernetes.io/arch` matching supported architectures
-6. Reconciler removes the scheduling gate — pod enters the regular scheduling cycle
+2. Operator controller deploys operand components (controller + webhook Deployments, RBAC, MutatingWebhookConfiguration)
+3. Webhook intercepts new pod creation and adds `multiarch.openshift.io/scheduling-gate`
+4. Pod reconciler watches Pending pods with the gate, inspects container images to determine supported architectures
+5. Reconciler adds `kubernetes.io/arch` nodeAffinity (required) and optionally preferred scheduling terms
+6. Reconciler removes the scheduling gate, allowing the scheduler to place the pod
 
-**Secondary workflow — ENoExec Monitoring:**
-An eBPF-based daemon on each node detects exec format errors (wrong-architecture binaries) and creates `ENoExecEvent` CRs. A handler controller processes these and publishes Kubernetes events on affected pods.
+**PodPlacementConfig** (namespaced) extends this with CEL-based architecture rules that override image inspection results for matching pods, enabling fine-grained per-namespace control.
 
-**Three CRDs:**
-- `ClusterPodPlacementConfig` — cluster-scoped singleton controlling the operand lifecycle and global config
-- `PodPlacementConfig` — namespace-scoped, label-selected pod matching with CEL rules and priority-based ordering
-- `ENoExecEvent` — cluster-scoped, created by the eBPF daemon when exec format errors are detected
+**ENoExecEvent** monitors exec format errors via eBPF on nodes. A DaemonSet captures ENOEXEC syscall failures and creates ENoExecEvent CRs. The handler controller processes them and publishes events on affected pods.
 
 ## Component/Controller Details
 
-All controllers use **controller-runtime**. The binary runs in one of four mutually exclusive modes:
-
-| Mode | Flag | Leader Election ID | Controller |
-|------|------|--------------------|------------|
-| Operator | `--enable-operator` | `operator-208d7abd.multiarch.openshift.io` | `ClusterPodPlacementConfigReconciler` |
-| PPC Controllers | `--enable-ppc-controllers` | `ppc-controllers-208d7abd.multiarch.openshift.io` | `PodReconciler` |
-| PPC Webhook | `--enable-ppc-webhook` | (none — webhook only) | `PodSchedulingGateMutatingWebHook` |
-| ENoExec Controllers | `--enable-enoexec-event-controllers` | `enoexecevent-controllers-208d7abd.multiarch.openshift.io` | `ENoExecEventReconciler` |
+| Component | Framework | Mode Flag | Leader Election ID |
+|-----------|-----------|-----------|-------------------|
+| ClusterPodPlacementConfigReconciler | controller-runtime + library-go events | `--enable-operator` | `operator-208d7abd.multiarch.openshift.io` |
+| PodReconciler | controller-runtime | `--enable-ppc-controllers` | `ppc-controllers-208d7abd.multiarch.openshift.io` |
+| PodSchedulingGateMutatingWebHook | controller-runtime webhook | `--enable-ppc-webhook` | (shares webhook mode) |
+| ENoExecEventHandler | controller-runtime | `--enable-enoexec-event-controllers` | `enoexecevent-controllers-208d7abd.multiarch.openshift.io` |
+| GlobalPullSecretSyncer | manager runnable | (with ppc-controllers) | — |
+| CPPCSyncer | manager runnable | `--enable-cppc-informer` | — |
 
 **Startup sequence** (`cmd/main.go`):
-1. Parse flags via `bindFlags()` — validates exactly one `--enable-*` flag is set
-2. Register schemes (v1alpha1, v1beta1, monitoring)
-3. Build manager with mode-specific cache, webhook, and metrics configuration
-4. Register controllers, runnables, and health checks for the selected mode
-5. Start manager with leader election (except webhook mode)
-
-**Concurrency**: PodReconciler uses `MaxConcurrentReconciles = NumCPU * 4` (`internal/controller/podplacement/pod_reconciler.go:344`) because image inspection is I/O-bound. The webhook uses an `ants` multi-pool (`ants.NewMultiPool(16, 16, ants.LeastTasks)` — 16 sub-pools of 16 goroutines, up to 256 total) for event publishing (`cmd/main.go:264`).
+1. `bindFlags()` — parse CLI flags, initialize atomic log level
+2. `validateFlags()` — ensure exactly one mode flag is set
+3. Build cache options (Pending pod field selector for ppc-controllers mode)
+4. Create controller-runtime Manager with scheme, metrics, webhook server
+5. Conditionally call `RunOperator`, `RunClusterPodPlacementConfigOperandControllers`, `RunClusterPodPlacementConfigOperandWebHook`, or `RunENoExecEventControllers`
+6. `mgr.Start()` — blocks until signal
 
 ## Resource Management
 
-The operator controller uses **library-go `resourceapply`** for operand resource management, not raw Create/Update:
+The operator controller uses a **dual apply strategy**:
 
 | Resource Type | Apply Method | Code Reference |
 |---------------|-------------|----------------|
-| Deployment | `applyDeployment` (custom wrapper using library-go generation tracking) | `pkg/utils/resource.go:72-73` |
-| DaemonSet | `applyDaemonSet` (custom wrapper) | `pkg/utils/resource.go:74-75` |
-| Service | `applyService` (custom wrapper) | `pkg/utils/resource.go:76-77` |
-| MutatingWebhookConfiguration | `resourceapply.ApplyMutatingWebhookConfigurationImproved` | `pkg/utils/resource.go:78-80` |
-| Role, RoleBinding | `resourceapply.ApplyRole`, `resourceapply.ApplyRoleBinding` | `pkg/utils/resource.go:81-83` |
-| ClusterRole, ClusterRoleBinding | `resourceapply.ApplyClusterRole`, `resourceapply.ApplyClusterRoleBinding` | `pkg/utils/resource.go:86-89` |
-| ServiceAccount | `resourceapply.ApplyServiceAccount` | `pkg/utils/resource.go:84-86` |
-| ServiceMonitor, PrometheusRule | `resourceapply.ApplyServiceMonitor/ApplyPrometheusRule` (via unstructured) | `pkg/utils/resource.go:91-106` |
+| ClusterRole, ClusterRoleBinding | `resourceapply.ApplyClusterRole/Binding` | `pkg/utils/resource.go:88-90` |
+| Role, RoleBinding | `resourceapply.ApplyRole/Binding` | `pkg/utils/resource.go:82-84` |
+| ServiceAccount | `resourceapply.ApplyServiceAccount` | `pkg/utils/resource.go:86` |
+| MutatingWebhookConfiguration | `resourceapply.ApplyMutatingWebhookConfigurationImproved` | `pkg/utils/resource.go:79` |
+| ServiceMonitor, PrometheusRule | `resourceapply` (dynamic unstructured) | `pkg/utils/resource.go:96+` |
+| Deployment, Service | Custom apply via `resourcemerge` + Get/Create/Update | `pkg/utils/resource.go` (`applyDeployment`, `applyService`) |
+| ClusterPodPlacementConfig (status, finalizers) | `controller-runtime` `r.Update()` | `internal/controller/operator/clusterpodplacementconfig_controller.go:201+` |
 
-**Pod reconciler** and **ENoExec handler** use direct `r.Update()` calls (controller-runtime client) to patch pod/CR status and remove scheduling gates.
+**DO NOT** mix these: RBAC/webhook resources go through `ApplyResource` (library-go), CR status and finalizers go through controller-runtime's `r.Update()`.
 
-**Operator uses finalizers** for ordered teardown:
-- `finalizers.multiarch.openshift.io/pod-placement` — ensures pods are ungated before operand removal
-- `finalizers.multiarch.openshift.io/no-pod-placement-config` — tracks PodPlacementConfig dependency
-- `finalizers.multiarch.openshift.io/enoexec-events` — enoexec cleanup
+The pod reconciler uses controller-runtime `r.Update()` (full-object update, not status subresource) to apply pod affinity changes and remove scheduling gates (`internal/controller/podplacement/pod_reconciler.go:104`).
 
-All operand resources have `ownerReferences` set via `ctrl.SetControllerReference`, enabling garbage collection when the CPPC CR is deleted.
+## Feature Gates
+
+This operator does **not** define its own feature gates. It does not use `openshift/api` FeatureGate definitions or TechPreviewNoUpgrade gating. Feature enablement is entirely flag-driven at the binary level.
 
 ## Error Classification
 
-| Error Type | Effect | Code Reference |
-|------------|--------|----------------|
-| `requeueAfterError` | Requeue after configurable duration (e.g., 5s) | `internal/controller/operator/clusterpodplacementconfig_controller.go:76-79` |
-| Image inspection failure | Retried up to `MaxRetryCount` (5), then gate removed with error labels | `internal/controller/podplacement/pod_model.go:47` |
-| Status update failure | Returns error to requeue | operator controller pattern throughout |
-| Webhook `failurePolicy: Ignore` | Pod proceeds without gating if webhook is unavailable | `internal/controller/operator/podplacement_objects.go:43` |
-
-## Generated Code Inventory
-
-| File/Pattern | Generator | Regenerate Command |
-|-------------|-----------|-------------------|
-| `api/*/zz_generated.deepcopy.go` | controller-gen | `make generate` |
-| `config/crd/bases/*.yaml` | controller-gen | `make manifests` |
-| `config/rbac/role.yaml` | controller-gen (kubebuilder markers) | `make manifests` |
-| `bundle/manifests/*.yaml` | operator-sdk | `make bundle VERSION=<ver>` |
-
-**NEVER hand-edit** any `zz_generated*` file or CRD YAML under `config/crd/bases/`.
-
-## API Behavioral Contracts
-
-**Singleton constraint**: `ClusterPodPlacementConfig` must be named `"cluster"`. The validation webhook rejects any other name (`api/v1beta1/clusterpodplacementconfig_webhook.go`).
-
-**API versions**: v1alpha1 has a conversion webhook to v1beta1 (hub). v1beta1 is the storage version.
-
-**Namespace exclusions** (hardcoded in `shouldIgnorePod`, `internal/controller/podplacement/pod_model.go:471`):
-- Operator's own namespace (`utils.Namespace()`)
-- `kube-*` prefixed namespaces
-- Pods with `spec.nodeName` already set
-- Pods with control-plane nodeSelector (`node-role.kubernetes.io/master` or `node-role.kubernetes.io/control-plane`)
-- DaemonSet-owned pods
-
-**DO NOT** assume `openshift-*` or `hypershift-*` namespaces are excluded — they are not hardcoded. They require explicit `namespaceSelector` configuration on the CR.
-
-**Fallback architecture**: When image inspection fails and `spec.fallbackArchitecture` is set (one of `amd64`, `arm64`, `ppc64le`, `s390x`), the pod is scheduled to nodes of that architecture instead of failing.
-
-**PodPlacementConfig priority**: Namespaced PodPlacementConfig resources are applied in priority order (0-255). Higher priority configs take precedence for preferred affinity weights.
-
-**Plugin system** (`api/common/plugins/`):
-- `NodeAffinityScoringPluginName` — adds preferred (soft) nodeAffinity based on cluster node distribution
-- `CelArchitecturePlacementPluginName` — applies CEL-based architecture rules
-- `ExecFormatErrorMonitorPluginName` — enables the eBPF-based enoexec monitoring subsystem
-
-**Scheduling gate label tracking**: The operator labels pods with `multiarch.openshift.io/scheduling-gate: gated` when gated and `removed` when the gate is lifted. Additional labels indicate `single-arch`, `multi-arch`, `no-supported-arch`, and `fallback-arch` for debugging.
+| Error Type | Behavior | Code Reference |
+|-----------|----------|----------------|
+| `requeueAfterError` | Custom type for controlled requeue with specific duration | `internal/controller/operator/clusterpodplacementconfig_controller.go:76-84` |
+| Image inspection failure | Retried up to max retries; if `fallbackArchitecture` is set, uses fallback | `internal/controller/podplacement/pod_reconciler.go` |
+| CR not found (404) | Ignored (reconcile ends) | Standard controller-runtime pattern |
+| Status update failure | Merged with primary errors via `mergeWithStatusErr` | `internal/controller/operator/clusterpodplacementconfig_controller.go:87-97` |
 
 ## OpenShift Integration Points
 
-| Integration | Mechanism | Code Reference |
-|------------|-----------|----------------|
-| OLM lifecycle | CSV in `bundle/manifests/`, `spec.replaces` chain | `bundle/manifests/multiarch-tuning-operator.clusterserviceversion.yaml` |
-| CA bundle injection | Annotation `service.beta.openshift.io/inject-cabundle: true` on webhook config | `internal/controller/operator/podplacement_objects.go:29` |
-| Monitoring | ServiceMonitor + PrometheusRule (conditional on CRD availability) | `internal/controller/operator/clusterpodplacementconfig_controller.go:824-834` |
-| SCC | Detects `hostmount-anyuid` or `hostmount-anyuid-v2` for controller SecurityContext | `internal/controller/operator/clusterpodplacementconfig_controller.go:894` |
-| Global pull secret | Syncs OpenShift's global pull secret for image inspection | `internal/controller/podplacement/global_pull_secret.go` |
+| Integration | How | Code Reference |
+|-------------|-----|----------------|
+| library-go resourceapply | RBAC, webhook, ServiceMonitor resource management | `pkg/utils/resource.go` |
+| library-go events | Event recording on ClusterPodPlacementConfig changes | `cmd/main.go:228-238` |
+| Serving certificates | `service.beta.openshift.io/serving-cert-secret-name` annotation on Services | `internal/controller/operator/objects.go` |
+| Global pull secret | Syncs `openshift-config/pull-secret` for image inspection auth | `internal/controller/podplacement/global_pull_secret.go` |
+| Image registry certs | Reads `image-registry-certificates` ConfigMap | `cmd/main.go:355` |
+| SecurityContextConstraints | Pods annotated with `openshift.io/required-scc: restricted-v2` | `internal/controller/operator/objects.go:34` |
+| PrometheusRule alerts | Alert rules for operand component health | `internal/controller/operator/objects.go` (via resource builders) |
+| OLM | Bundle in `bundle/`, CSV in `bundle/manifests/` | Standard OLM lifecycle |
 
-## Plugins System
+## Generated Code Inventory
 
-Plugins are defined in `api/common/plugins/` and configured via the `plugins` field on ClusterPodPlacementConfig (global) and PodPlacementConfig (namespaced).
+| File Pattern | Generator | Regenerate |
+|-------------|-----------|-----------|
+| `api/*/zz_generated.deepcopy.go` | controller-gen | `make generate` |
+| `config/crd/bases/*.yaml` | controller-gen | `make manifests` |
+| `config/rbac/role.yaml` | controller-gen (RBAC markers) | `make manifests` |
+| `bundle/` | operator-sdk | `make bundle VERSION=<ver>` |
 
-**NodeAffinityScoring** (`plugins/nodeaffinityscoring_plugin.go`): Adds preferred nodeAffinity terms with architecture-specific weights. Weights can be configured per-architecture (1-100).
+**NEVER** hand-edit any `zz_generated*` file or `config/crd/bases/` YAML.
 
-**CelArchitecturePlacement** (`api/common/plugins/celarchitectureplacement_plugin.go`): Uses CEL (Common Expression Language) expressions evaluated at scheduling time to determine architecture constraints. Compiled programs are cached in an LRU cache (1024 entries) in `internal/controller/podplacement/cel_evaluator.go`.
+## API Behavioral Contracts
 
-**ExecFormatErrorMonitor**: Enables the eBPF-based daemon that detects exec format errors and the handler that processes them.
+### ClusterPodPlacementConfig (cluster-scoped singleton)
+- **Singleton**: Name must be `"cluster"` — enforced by convention via constant `common.SingletonResourceObjectName` (`api/common/const.go:3`); the validation webhook validates plugin config, not the resource name
+- **API versions**: v1alpha1 (with conversion webhook) → v1beta1 (storage version)
+- **Finalizers**: `finalizers.multiarch.openshift.io/pod-placement` (operand lifecycle), `finalizers.multiarch.openshift.io/no-pod-placement-config` (PPC object guard), `finalizers.multiarch.openshift.io/enoexec-events` (ENoExec cleanup)
+- **Status conditions**: `Available`, `Progressing`, `Degraded`, `Deprovisioning`, `PodPlacementControllerNotRolledOut`, `PodPlacementWebhookNotRolledOut`, `MutatingWebhookConfigurationNotAvailable`
+- **Deletion**: Ordered — removes scheduling gates from all gated pods before deleting operand Deployments
+- **Spec fields**: `logVerbosity` (Normal/Debug/Trace/TraceAll), `namespaceSelector`, `plugins` (NodeAffinityScoring), `fallbackArchitecture` (amd64/arm64/ppc64le/s390x/empty)
+
+### PodPlacementConfig (namespace-scoped)
+- **Purpose**: Fine-grained, per-namespace architecture rules using CEL expressions
+- **Priority**: `priority` field (0-255, default 0) — higher priority configs override lower ones
+- **Spec fields**: `labelSelector` (pod matching), `plugins` (CEL ArchitectureRule), `priority`
+- **CEL evaluation**: Compiled programs cached in LRU (1024 entries), evaluated per-pod
+
+### Scheduling Gate Contract
+- Gate name: `multiarch.openshift.io/scheduling-gate`
+- Labels set on processed pods: `multiarch.openshift.io/node-affinity` (`set` or `overriden`), `multiarch.openshift.io/scheduling-gate` (`gated`/`removed`), architecture labels (`single-arch`/`multi-arch`/`no-supported-arch`/`fallback-arch`)
+
+### Namespace Exclusions (hardcoded)
+- Operator's own namespace (`NAMESPACE` env var via `utils.Namespace()`)
+- `kube-*` prefixed namespaces
+- Pods already having `spec.nodeName`, control-plane nodeSelector, or DaemonSet ownership
+
+**WARNING**: `openshift-*` and `hypershift-*` namespaces are NOT hardcoded exclusions — they require explicit `namespaceSelector` configuration on the CR.
+
+### Pod Reconciler Concurrency
+- `MaxConcurrentReconciles = runtime.NumCPU() * 4` — optimized for I/O-bound image inspection
+- Cache field selector: only watches `status.phase=Pending` pods
+- Watches `PodPlacementConfig` to re-queue gated pods when PPC is created/updated/deleted
+
+### Image Inspection
+- Uses `containers/image` library (requires CGO + gpgme)
+- Supports OCI and Docker v2 manifest formats
+- Authenticates via synced global pull secret and registry certificates
+- Results cached to reduce registry queries
+- Supports multi-arch manifest lists — extracts supported architectures from all platforms
 
 ## Design References
 
-**Scheduling gate pattern**: The operator leverages KEP-3521 (Pod Scheduling Readiness) to temporarily prevent pod scheduling while image inspection determines architecture compatibility. This is a non-blocking pattern — the webhook's `failurePolicy: Ignore` ensures pods are not permanently blocked if the operator is down. The gate is removed even on inspection failure (with appropriate labels for debugging).
+### Scheduling Gate Approach (KEP-3521)
+**Decision**: Use Kubernetes scheduling gates rather than node selectors or admission rejection.
+**Rationale**: Gates allow the pod to exist in the API but prevent scheduling until architecture affinity is determined. This avoids race conditions, supports image inspection workflows, and integrates with the Kubernetes scheduler natively.
+**Consequences**: Requires K8s 1.27+ (scheduling gates GA). All gated pods must be ungated before operator removal.
 
-**Library-go resourceapply for operand management**: The operator controller uses library-go's `resourceapply` functions rather than raw Create/Update. This provides generation-based change detection — resources are only applied when their specification changes, reducing unnecessary API calls. See `pkg/utils/resource.go` for the type-switch dispatcher.
+### Dual Apply Strategy
+**Decision**: Use library-go `resourceapply` for RBAC/infrastructure resources and controller-runtime client for CR status updates.
+**Rationale**: `resourceapply` provides idempotent, cache-backed apply semantics with proper conflict resolution for shared infrastructure resources. CR status requires standard controller-runtime patterns for optimistic concurrency.
+**Consequences**: Two distinct update paths — never cross them. Operator controller tests must mock both client types.
 
-**Ordered deletion with finalizers**: The operator uses a finalizer-based ordered deletion sequence to ensure pods are ungated before operand removal. This prevents pods from being permanently blocked if the operator is deleted while pods are still gated.
+### CEL-Based Architecture Rules
+**Decision**: Use CEL expressions (via `cel-go`) for PodPlacementConfig architecture rules instead of static field matching.
+**Rationale**: CEL provides expressive, Kubernetes-native evaluation that can match on any pod field. LRU caching (1024 compiled programs) amortizes compilation cost.
+**Consequences**: Rules are evaluated per-pod; complex expressions can add latency. CEL environment is initialized once (`sync.Once`).
 
 ## Platform Documentation
 
-For generic OpenShift development patterns, testing conventions, and coding standards, see the [openshift/enhancements](https://github.com/openshift/enhancements) repository:
-- `dev-guide/` — development conventions
-- `guidelines/` — enhancement process
-- `CONVENTIONS.md` — coding standards
-
-## Image Inspection
-
-The image inspector (`pkg/image/`) is the central component for determining container image architecture support:
-
-- **Registry interaction**: Fetches image manifests via the `containers/image` library (requires CGO + gpgme)
-- **Multi-arch support**: Handles OCI image indexes and Docker v2.2 manifest lists to extract per-platform entries
-- **Authentication**: Uses pod-level pull secrets + the global pull secret (synced from `openshift-config/pull-secret`)
-- **Caching**: `image.FacadeSingleton()` provides a process-wide cache to avoid redundant registry queries
-- **Metrics**: Tracks inspection time (`mto_ppo_ctrl_time_to_inspect_image_seconds`) and failures (`mto_ppo_ctrl_failed_image_inspection_total`)
-
-Architecture set computation (`internal/controller/podplacement/pod_model.go`):
-1. For each container image, inspect the manifest to get supported architectures
-2. Intersect all container architecture sets — the pod runs only on architectures all containers support
-3. If intersection is empty, label the pod `multiarch.openshift.io/no-supported-arch` and remove the gate
-4. If non-empty, set required nodeAffinity matching the intersection and remove the gate
+For generic OpenShift development patterns, refer to the [openshift/enhancements](https://github.com/openshift/enhancements) repository:
+- Development conventions: [`dev-guide/`](https://github.com/openshift/enhancements/tree/master/dev-guide)
+- Enhancement process: [`guidelines/`](https://github.com/openshift/enhancements/tree/master/guidelines)
+- Coding standards: [`CONVENTIONS.md`](https://github.com/openshift/enhancements/blob/master/CONVENTIONS.md)
 
 ## SME Review Recommended
 
-- Exact behavior of `PodPlacementConfig` reconciler (currently a stub with `TODO` — implementation may be in-flight)
-- CEL plugin expression format and available variables/functions
-- ENoExec eBPF tracepoint specifics and kernel compatibility requirements
-- Downstream Konflux/Tekton pipeline configuration
+- Exact ICSP/IDMS/ITMS interaction with image inspection (noted as TODO in `pkg/image/inspector.go:92`)
+- eBPF tracepoint details and CRI runtime compatibility (`internal/controller/enoexecevent/daemon/internal/tracepoint/`)
+- OLM upgrade strategy details (CSV `spec.replaces`/`skipRange` patterns)

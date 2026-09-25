@@ -1,49 +1,48 @@
 # Multiarch Tuning Operator (MTO)
 
-**Repository**: `openshift/multiarch-tuning-operator` | **Default branch**: `main` | **Go**: 1.26 | **Framework**: controller-runtime + Kubebuilder
-
-Architecture-aware pod scheduling for multi-architecture OpenShift/Kubernetes clusters. Adds node affinity based on container image architectures via scheduling gates ([KEP-3521](https://github.com/kubernetes/enhancements/blob/afad6f270c7ac2ae853f4d1b72c379a6c3c7c042/keps/sig-scheduling/3521-pod-scheduling-readiness/README.md)).
+**Repository**: `github.com/openshift/multiarch-tuning-operator`
+**Purpose**: Architecture-aware pod scheduling for multi-arch OpenShift/Kubernetes clusters. Adds `kubernetes.io/arch` nodeAffinity to pods via scheduling gates and image inspection.
 
 ## Critical Warnings
 
-1. **NEVER assume uniform apply methods** — operator controller uses library-go `resourceapply` via `utils.ApplyResources()` for operand resources; pod controller uses `r.Update` to patch pods after gate removal
-2. **NEVER hand-edit `zz_generated.deepcopy.go`** — run `make generate` after API type changes
-3. **NEVER omit `namespaceSelector`** on ClusterPodPlacementConfig — without it, the webhook gates pods in `openshift-*` namespaces, blocking critical workloads
-4. **NEVER build without CGO** — image inspection requires `gpgme` (`gpgme-devel` / `libgpgme-dev`)
-5. **NEVER set multiple `--enable-*` flags** — binary runs in exactly one mode per process
+1. **NEVER** set more than one execution mode flag at a time (`--enable-operator`, `--enable-ppc-controllers`, `--enable-ppc-webhook`, `--enable-enoexec-event-controllers`)
+2. **NEVER** hand-edit `zz_generated.deepcopy.go` files — run `make generate`
+3. **NEVER** assume `openshift-*` namespaces are excluded from pod placement -- only `kube-*` and the operator namespace are hardcoded; others require `namespaceSelector` on the CR
+4. **NEVER** build without CGO — the `containers/image` library requires `gpgme-devel` (RHEL) or `libgpgme-dev` (Debian)
+5. **NEVER** mix `resourceapply` (RBAC, webhooks) with `controller-runtime` Update (CR status, finalizers) — see ARCHITECTURE.md §Resource Management
 
 ## Architecture at a Glance
 
-Four mutually exclusive binary modes: Operator (`--enable-operator`) manages CR lifecycle and deploys operands; PPC Controllers (`--enable-ppc-controllers`) reconcile gated pods; PPC Webhook (`--enable-ppc-webhook`) gates new pods; ENoExec Controllers (`--enable-enoexec-event-controllers`) handle exec format errors via eBPF.
+Single binary, four mutually exclusive modes: Operator → deploys operands (controller + webhook deployments). Pod Placement Controller → reconciles gated pods. Pod Placement Webhook → adds scheduling gates. ENoExecEvent Controllers → eBPF exec-format-error monitoring. The operator uses `library-go/resourceapply` for RBAC/webhook resources and `controller-runtime` client for CR status/finalizer updates. The pod reconciler uses `MaxConcurrentReconciles = NumCPU * 4` (I/O-bound image inspection). CEL-based architecture rules are evaluated via `PodPlacementConfig` (namespaced).
 
 ## Documentation
 
 | Need | Start here |
 |------|-----------|
-| Architecture, API contracts, integrations | [ai-docs/ARCHITECTURE.md](ai-docs/ARCHITECTURE.md) |
-| Build, deploy, common tasks | [ai-docs/DEVELOPMENT.md](ai-docs/DEVELOPMENT.md) |
-| Test suites, patterns, running tests | [ai-docs/TESTING.md](ai-docs/TESTING.md) |
-| Enhancement proposals | [ai-docs/ENHANCEMENTS.md](ai-docs/ENHANCEMENTS.md) |
-| Metrics reference | [docs/metrics.md](docs/metrics.md) |
-| OCP release process | [docs/ocp-release.md](docs/ocp-release.md) |
+| Internals, integrations, behavioral contracts | [ai-docs/ARCHITECTURE.md](ai-docs/ARCHITECTURE.md) |
+| Build, common tasks, env vars | [ai-docs/DEVELOPMENT.md](ai-docs/DEVELOPMENT.md) |
+| Test suites and patterns | [ai-docs/TESTING.md](ai-docs/TESTING.md) |
+| Enhancement proposals / design docs | [ai-docs/ENHANCEMENTS.md](ai-docs/ENHANCEMENTS.md) |
+| Metrics and monitoring | [docs/metrics.md](docs/metrics.md) |
 | Alert runbooks | [docs/alerts/](docs/alerts/) |
-| Non-OKD cluster setup | [docs/support-non-okd.md](docs/support-non-okd.md) |
+| Non-OKD cluster support | [docs/support-non-okd.md](docs/support-non-okd.md) |
+| OCP release process | [docs/ocp-release.md](docs/ocp-release.md) |
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `cmd/main.go` | Entrypoint, mode flags, manager setup |
-| `api/v1beta1/clusterpodplacementconfig_types.go` | ClusterPodPlacementConfig CRD (hub) |
-| `api/v1beta1/podplacementconfig_types.go` | PodPlacementConfig CRD (namespaced) |
-| `internal/controller/operator/` | Operator mode controller |
-| `internal/controller/podplacement/pod_reconciler.go` | Pod reconciliation logic |
-| `internal/controller/podplacement/pod_model.go` | Pod processing, image inspection, affinity |
-| `internal/controller/podplacement/scheduling_gate_mutating_webhook.go` | Webhook adding scheduling gates |
-| `pkg/image/` | Container image architecture inspection |
-| `pkg/utils/const.go` | All operator constants and label keys |
+| `cmd/main.go` | Binary entrypoint, flag parsing, mode selection |
+| `internal/controller/operator/clusterpodplacementconfig_controller.go` | Operator reconciler — deploys/manages operands |
+| `internal/controller/podplacement/pod_reconciler.go` | Pod reconciler — image inspection, nodeAffinity |
+| `internal/controller/podplacement/scheduling_gate_mutating_webhook.go` | Mutating webhook — adds scheduling gate |
+| `internal/controller/podplacement/cel_evaluator.go` | CEL expression engine for architecture rules |
+| `pkg/utils/resource.go` | `ApplyResource` — library-go resourceapply dispatcher |
+| `api/v1beta1/clusterpodplacementconfig_types.go` | ClusterPodPlacementConfig CRD types |
+| `api/v1beta1/podplacementconfig_types.go` | PodPlacementConfig (namespaced) CRD types |
 
 ## External References
 
-- [OpenShift Enhancement](https://github.com/openshift/enhancements/blob/6cebc13f0672c601ebfae669ea4fc8ca632721b5/enhancements/multi-arch/multiarch-manager-operator.md)
-- [Platform conventions](https://github.com/openshift/enhancements) (`dev-guide/`, `guidelines/`, `CONVENTIONS.md`)
+- [OpenShift Enhancement](https://github.com/openshift/enhancements/blob/master/enhancements/multi-arch/multiarch-manager-operator.md)
+- [KEP-3521: Pod Scheduling Readiness](https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/3521-pod-scheduling-readiness)
+- Platform docs: [openshift/enhancements dev-guide/](https://github.com/openshift/enhancements/tree/master/dev-guide), [CONVENTIONS.md](https://github.com/openshift/enhancements/blob/master/CONVENTIONS.md)

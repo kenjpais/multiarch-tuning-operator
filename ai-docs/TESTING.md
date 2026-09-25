@@ -1,120 +1,144 @@
 # Testing Guide
 
-## Test Framework
-
-All tests use **Ginkgo/Gomega** (`github.com/onsi/ginkgo/v2`, `github.com/onsi/gomega`). Unit tests use **envtest** for a local API server.
-
 ## Test Suites
 
-| Suite | Location | Command | Requirements |
-|-------|----------|---------|--------------|
-| Unit tests | `*_test.go` alongside source | `make unit` | None (envtest provides API server) |
-| E2E tests | `pkg/e2e/` | `make e2e` | Deployed operator + `KUBECONFIG` |
-| Snapshot tests | Throughout | `make verify-snapshots` | None |
+| Suite | Location | Run Command | Framework |
+|-------|----------|-------------|-----------|
+| Unit tests | `*_test.go` alongside source | `make unit` | Ginkgo/Gomega + envtest |
+| E2E — Operator | `pkg/e2e/operator/` | `make e2e` | Ginkgo/Gomega |
+| E2E — Pod Placement | `pkg/e2e/podplacement/` | `make e2e` | Ginkgo/Gomega |
+| E2E — PodPlacementConfig | `pkg/e2e/podplacementconfig/` | `make e2e` | Ginkgo/Gomega |
 
 ## Running Tests
 
-### Unit tests
-
 ```bash
-# All unit tests (containerized by default)
+# All checks + unit tests (containerized by default)
+make test
+
+# Unit tests only
 make unit
 
-# Run locally instead of in container
+# Unit tests locally (requires gpgme-devel)
 NO_DOCKER=1 make unit
 
-# Run a specific test
-GINKGO_ARGS="-v --focus='your test pattern'" make unit
+# Focus on a specific test
+GINKGO_ARGS="-v --focus='should set the nodeAffinity'" make unit
 
-# Full check suite (formatting, linting, security, + unit tests)
-make test
-```
-
-Test output goes to `ARTIFACT_DIR` (default: `./_output`). Coverage report: `test-unit-coverage.out`.
-
-### E2E tests
-
-```bash
-# Requires a cluster with the operator deployed
+# E2E tests (requires deployed operator)
 KUBECONFIG=/path/to/kubeconfig NAMESPACE=openshift-multiarch-tuning-operator make e2e
+
+# Coverage report
+NO_DOCKER=1 make unit
+# Output: test-unit-coverage.out
 ```
 
-E2E tests are in `pkg/e2e/` with separate suites:
-- `pkg/e2e/operator/` — operator lifecycle tests
-- `pkg/e2e/podplacement/` — pod placement behavior tests
-- `pkg/e2e/podplacementconfig/` — PodPlacementConfig behavior tests
+## Test Infrastructure
 
-### Snapshot verification
+### envtest (Unit Tests)
 
-```bash
-make verify-snapshots  # Checks test snapshots are up to date
-```
+Unit tests use controller-runtime's `envtest` to provide a real API server and etcd without a full cluster. Each controller package has a `suite_test.go` that:
 
-Uses `hack/check-snapshots.sh` to ensure expected outputs match.
+1. Starts envtest with CRD paths from `config/crd/bases`
+2. Registers the scheme (v1alpha1, v1beta1, monitoring)
+3. Creates a controller-runtime manager with webhook and metrics servers
+4. Sets up controllers under test
+5. Tears down after all tests complete
 
-## Test Helpers
-
-### Fluent builders (`pkg/testing/builder/`)
-
-The project provides fluent builder functions for constructing Kubernetes objects in tests:
-
+Example — `internal/controller/podplacement/suite_test.go`:
 ```go
-// Example: build a pod with scheduling gate (pkg/testing/builder/pod.go)
-pod := builder.NewPod().
-    WithName("test-pod").
-    WithNamespace("test-ns").
-    WithSchedulingGates(utils.SchedulingGateName).
-    WithContainersImages("registry.io/test:latest").
-    Build()
-```
-
-Builders exist for Pods, Deployments, Namespaces, and other common objects.
-
-### Framework utilities (`pkg/testing/framework/`)
-
-Provides test lifecycle helpers:
-- Cluster connection and client setup
-- Namespace creation/cleanup
-- Resource assertion helpers
-- Wait/retry utilities for eventually-consistent checks
-
-## Test Patterns
-
-### Controller unit tests
-
-Controller tests use envtest (`sigs.k8s.io/controller-runtime/pkg/envtest`) to run a local API server:
-
-```go
-var _ = BeforeSuite(func() {
-    testEnv = &envtest.Environment{
-        CRDDirectoryPaths: []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
-    }
-    cfg, err = testEnv.Start()
-    // ...
-})
-```
-
-### Webhook tests
-
-Webhook tests create pods with various configurations and verify the webhook correctly adds or skips the scheduling gate based on namespace selectors, exclusion rules, and pod characteristics.
-
-### Image inspection mocks
-
-Tests mock the image inspection cache to control architecture responses without requiring registry access:
-
-```go
-// Tests set imageInspectionCache to a mock that returns controlled results
-imageInspectionCache = &mockCache{
-    inspectResult: sets.New("amd64", "arm64"),
+testEnv = &envtest.Environment{
+    CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
+    ErrorIfCRDPathMissing: true,
 }
 ```
 
-## CI Integration
+### Fake Image Registry
 
-The CI pipeline runs via `hack/ci-test.sh`, which executes the full test suite including:
-- `make test` (all checks + unit tests)
-- E2E tests against a deployed cluster (when available)
+The `pkg/testing/image/fake/` package provides a test container registry that serves configurable image manifests without needing a real registry. It supports:
 
-Tests run in containers by default using `BUILD_IMAGE`. Set `NO_DOCKER=1` to run locally.
+- Multi-arch manifest lists with configurable platforms
+- Authentication (basic auth via `pkg/testing/image/fake/registry/auth/`)
+- OCI and Docker v2 manifest formats
 
-For generic OpenShift testing conventions, see [openshift/enhancements](https://github.com/openshift/enhancements) (`dev-guide/`).
+Used in pod reconciler and image inspector tests to simulate image inspection without network access.
+
+### Test Builders (`pkg/testing/builder/`)
+
+Fluent builders for creating Kubernetes objects in tests:
+
+```go
+// Example: create a pod with scheduling gates (see pkg/testing/builder/pod.go)
+pod := builder.NewPod().
+    WithGenerateName("test-pod").
+    WithSchedulingGates(utils.SchedulingGateName).
+    Build()
+```
+
+These builders reduce test boilerplate and ensure consistent object construction across test suites.
+
+### Test Framework (`pkg/testing/framework/`)
+
+Shared utilities for test setup and assertions:
+
+- `suites_utils.go`: Helper functions for creating/cleaning up test resources
+- `GetClusterMinorVersion()`: Detects cluster version for version-specific behavior
+
+## Test Patterns
+
+### Controller Unit Tests
+
+Controllers are tested by:
+1. Creating resources via the envtest API server
+2. Triggering reconciliation
+3. Asserting on resource state changes
+
+Key pattern — pod placement tests create pods with scheduling gates and verify:
+- NodeAffinity is set with correct architectures
+- Scheduling gate is removed after processing
+- Labels are applied (`multiarch.openshift.io/node-affinity`, `single-arch`/`multi-arch`)
+
+### CEL Evaluator Tests
+
+CEL tests (`cel_evaluator_test.go`, `cel_*_test.go`) verify:
+- Expression compilation and caching
+- Pod matching with various label selectors
+- Architecture rule application and precedence
+- Fallback behavior when no rules match
+- LRU cache eviction behavior
+
+### Webhook Tests
+
+Webhook tests (`scheduling_gate_mutating_webhook_test.go`, `webhook_cel_test.go`) verify:
+- Scheduling gate is added to eligible pods
+- Pods in excluded namespaces are not gated
+- DaemonSet pods are skipped
+- Pods with control-plane nodeSelector are skipped
+- PodPlacementConfig namespace-scoped behavior
+
+### Operator Controller Tests
+
+Operator tests (`clusterpodplacementconfig_controller_test.go`) verify:
+- Operand deployment lifecycle (create, update, delete)
+- Finalizer management
+- Status condition updates
+- Ordered deletion (ungating pods before removing operands)
+
+## E2E Test Requirements
+
+- Running operator deployed to a cluster (`make deploy`)
+- `KUBECONFIG` pointing to the cluster
+- `NAMESPACE` set to the operator's namespace (default: `openshift-multiarch-tuning-operator`)
+- Cluster must have nodes with at least one architecture
+
+E2E suites are organized by component:
+- `pkg/e2e/operator/`: Tests ClusterPodPlacementConfig CR lifecycle
+- `pkg/e2e/podplacement/`: Tests pod scheduling gate and nodeAffinity application
+- `pkg/e2e/podplacementconfig/`: Tests namespace-scoped PodPlacementConfig behavior
+
+## Test Artifacts
+
+- Coverage output: `$ARTIFACT_DIR/test-unit-coverage.out` (generated by `hack/ci-test.sh` when `SKIP_COVERAGE` is not set)
+- Test artifacts: `$ARTIFACT_DIR` (defaults to a temp directory; set explicitly for CI)
+- Snapshot verification: `make verify-snapshots`
+
+For generic OpenShift testing practices, see the [openshift/enhancements dev-guide](https://github.com/openshift/enhancements/tree/master/dev-guide).

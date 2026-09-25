@@ -1,58 +1,62 @@
-# Review Instructions
+# Code Review Instructions
 
-## Scope
+## Priority Areas
 
-This operator provides architecture-aware pod scheduling for multi-arch clusters. Reviews should focus on correctness of scheduling logic, API contract preservation, and operand lifecycle safety.
-
-## Critical Review Areas
-
-- **Pod model logic** (`internal/controller/podplacement/pod_model.go`): Verify `shouldIgnorePod` exclusion rules, architecture set computation, and affinity generation
-- **Webhook behavior** (`internal/controller/podplacement/scheduling_gate_mutating_webhook.go`): Verify namespace selector handling and scheduling gate addition
-- **Operator reconciliation** (`internal/controller/operator/`): Verify finalizer ordering, resource apply logic, and status condition updates
-- **API types** (`api/v1beta1/`): Verify validation webhooks, conversion logic, and backward compatibility
+1. **Resource apply method correctness**: RBAC/webhook resources must use `pkg/utils/resource.go` `ApplyResource()` (library-go `resourceapply`). CR status/finalizer updates must use controller-runtime `r.Update()`. Never cross these paths.
+2. **Namespace exclusion logic**: Only `kube-*` and the operator namespace are hardcoded exclusions in `shouldIgnorePod`. Verify changes don't accidentally exclude or include namespaces.
+3. **Scheduling gate lifecycle**: Gate must be removed after nodeAffinity is set. Orphaned gates block pod scheduling permanently.
+4. **Image inspection error handling**: Verify retry logic and `fallbackArchitecture` behavior on inspection failures.
+5. **CEL expression safety**: CEL programs are cached (LRU 1024). Verify new expressions compile correctly and cache invalidation is handled.
 
 ## Do not report
 
-These are generated, vendored, or auto-managed — do not flag style or structure issues:
-
-- `vendor/**` — vendored dependencies
-- `**/zz_generated*.go` — controller-gen generated code
-- `config/crd/bases/**` — generated CRD YAML
-- `config/rbac/role.yaml` — generated RBAC
-- `bundle/manifests/**` — generated OLM bundle
-- `go.sum` — dependency checksums
-- `hack/**` — build/CI scripts (review for security only)
-
-## Platform conventions
-
-Follow [openshift/enhancements](https://github.com/openshift/enhancements) conventions:
-- API changes must follow `dev-guide/api-conventions.md`
-- Status conditions follow the operator pattern (Available, Progressing, Degraded)
-- RBAC markers must not be placed on operand code (see `internal/controller/podplacement/pod_reconciler.go:56-58`)
+- Style issues enforced by CI (`make fmt`, `make goimports`, `make lint`, `make vet`)
+- Generated file modifications (`**/zz_generated*`, `config/crd/bases/**`, `config/rbac/role.yaml`)
+- Vendored dependency code (`vendor/**`)
+- Test helper boilerplate (`pkg/testing/**`)
+- Bundle manifest formatting (`bundle/**`)
 
 ## Path-specific rules
 
-| Path | Focus |
-|------|-------|
-| `api/**` | Backward compatibility, validation webhook completeness, CRD marker correctness |
-| `internal/controller/podplacement/pod_model.go` | Exclusion logic correctness, architecture intersection, gate lifecycle |
-| `internal/controller/operator/` | Finalizer ordering, resource apply method correctness, status condition transitions |
-| `pkg/image/` | Registry auth handling, manifest parsing, cache invalidation |
-| `pkg/utils/const.go` | Label/annotation key consistency, no duplicate definitions |
-| `internal/controller/podplacement/cel_*.go` | CEL expression safety, cache bounds, evaluation correctness |
-| `cmd/main.go` | Flag validation, mode exclusivity, startup sequence |
+### `api/v1beta1/` — CRD type definitions
+- Verify kubebuilder markers match intended validation
+- Check that new fields have proper `+optional` or `+kubebuilder:validation:Required` markers
+- Ensure DeepCopy is regenerated (`make generate`)
 
-## High-churn areas (severity: elevated)
+### `internal/controller/operator/` — Operator reconciler
+- Verify resource builders in `objects.go` produce correct RBAC and deployment specs
+- Check finalizer add/remove ordering (pod ungating must precede operand deletion)
+- Verify status condition updates cover all paths
 
-- `internal/controller/operator/clusterpodplacementconfig_controller.go` — operator reconciliation core
-- `internal/controller/podplacement/pod_model.go` — pod processing logic
-- `internal/controller/podplacement/cel_evaluator.go` — CEL plugin engine
-- `bundle/manifests/multiarch-tuning-operator.clusterserviceversion.yaml` — OLM metadata
+### `internal/controller/podplacement/` — Pod reconciler and webhook
+- Verify nodeAffinity mutation is correct (in-place update, not replacement of existing terms)
+- Check `MaxConcurrentReconciles` is appropriate for I/O-bound workloads
+- Verify webhook path registration matches MutatingWebhookConfiguration
 
-## Verification checklist for PRs
+### `pkg/utils/resource.go` — Resource apply dispatcher
+- Each resource type must route to the correct `resourceapply.*` function
+- New resource types need a case in the type switch
+- `resourceCache` must be passed for idempotent applies
 
-- [ ] `make test` passes (includes fmt, vet, lint, gosec, unit tests)
-- [ ] `make manifests && make generate && make verify-diff` shows no changes
-- [ ] API changes include conversion webhook updates if modifying v1alpha1↔v1beta1
-- [ ] New controller patterns include unit tests with envtest
-- [ ] Namespace exclusion changes preserve `shouldIgnorePod` contract
+### `pkg/image/` — Image inspection
+- Verify registry auth handling (pull secrets, certificates)
+- Check cache invalidation on pull secret changes
+- CGO/gpgme dependency awareness
+
+### `cmd/main.go` — Binary entrypoint
+- Only one execution mode flag may be set at a time (validated by `validateFlags()`)
+- Verify new flags are registered in `bindFlags()` and validated
+- Leader election IDs are deterministic; changes affect rolling upgrades
+
+### `api/v1alpha1/` — Alpha API with conversion
+- Changes must maintain conversion compatibility with v1beta1
+- Conversion logic in `clusterPodPlacementConfig_conversion.go`
+
+### `internal/controller/enoexecevent/` — eBPF monitoring
+- eBPF tracepoint code requires careful review for kernel compatibility
+- ENoExecEvent CR lifecycle must handle node failures gracefully
+
+## Platform conventions
+
+- Follow [dev-guide/api-conventions.md](https://github.com/openshift/enhancements/blob/master/dev-guide/api-conventions.md) for API changes
+- Follow [CONVENTIONS.md](https://github.com/openshift/enhancements/blob/master/CONVENTIONS.md) for coding standards

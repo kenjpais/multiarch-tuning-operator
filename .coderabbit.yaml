@@ -1,49 +1,81 @@
-language: en-US
+language: en
 reviews:
+  profile: assertive
+  filePatterns:
+    - "REVIEW.md"
+    - "AGENTS.md"
+  path_filters:
+    - "!vendor/**"
+    - "!**/zz_generated*"
+    - "!config/crd/bases/**"
+    - "!config/rbac/role.yaml"
+    - "!bundle/**"
+    - "!pkg/testing/**"
+  path_instructions:
+    - path: "api/v1beta1/**"
+      instructions: |
+        Verify kubebuilder markers match intended validation. Check +optional
+        and +kubebuilder:validation:Required markers. Ensure DeepCopy is
+        regenerated (make generate).
+    - path: "api/v1alpha1/**"
+      instructions: |
+        Changes must maintain conversion compatibility with v1beta1.
+        Verify conversion logic in clusterPodPlacementConfig_conversion.go.
+    - path: "internal/controller/operator/**"
+      instructions: |
+        Verify resource builders produce correct RBAC and deployment specs.
+        Check finalizer ordering (ungating before operand deletion). Verify
+        status condition updates cover all paths. RBAC/webhook resources must
+        use ApplyResource (library-go resourceapply), CR status uses
+        controller-runtime r.Update().
+    - path: "internal/controller/podplacement/**"
+      instructions: |
+        Verify nodeAffinity mutation is in-place (not replacing existing terms).
+        Check scheduling gate lifecycle (gate removed after affinity set).
+        Verify namespace exclusion logic in shouldIgnorePod.
+    - path: "internal/controller/enoexecevent/**"
+      instructions: |
+        eBPF tracepoint code requires careful review for kernel compatibility.
+        ENoExecEvent CR lifecycle must handle node failures gracefully.
+    - path: "pkg/utils/resource.go"
+      instructions: |
+        Each resource type must route to the correct resourceapply function.
+        New types need a case in the type switch. resourceCache must be passed.
+    - path: "pkg/image/**"
+      instructions: |
+        Verify registry auth handling. Check cache invalidation on pull secret
+        changes. Be aware of CGO/gpgme dependency.
+    - path: "cmd/main.go"
+      instructions: |
+        Only one execution mode flag may be set at a time. Verify new flags are
+        registered in bindFlags() and validated. Leader election IDs are
+        deterministic; changes affect rolling upgrades.
   auto_review:
     enabled: true
     drafts: false
     base_branches:
       - main
-  path_filters:
-    - "!vendor/**"
-    - "!**/zz_generated*.go"
-    - "!config/crd/bases/**"
-    - "!config/rbac/role.yaml"
-    - "!bundle/manifests/**"
-    - "!go.sum"
-  path_instructions:
-    - path: "api/**"
-      instructions: "Review for backward compatibility, validation webhook completeness, and CRD marker correctness."
-    - path: "internal/controller/podplacement/pod_model.go"
-      instructions: "Review exclusion logic correctness, architecture intersection, and gate lifecycle."
-    - path: "internal/controller/operator/**"
-      instructions: "Review finalizer ordering, resource apply method correctness, and status condition transitions."
-    - path: "pkg/image/**"
-      instructions: "Review registry auth handling, manifest parsing, and cache invalidation."
-    - path: "internal/controller/podplacement/cel_*.go"
-      instructions: "Review CEL expression safety, cache bounds, and evaluation correctness."
-    - path: "cmd/main.go"
-      instructions: "Review flag validation, mode exclusivity, and startup sequence."
-    - path: "pkg/utils/const.go"
-      instructions: "Review label/annotation key consistency and no duplicate definitions."
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  sequence_diagrams: false
+  changed_files_summary: true
+  abort_on_close: true
   tools:
+    github-checks:
+      enabled: true
+    shellcheck:
+      enabled: true
     ast-grep:
       essential_rules: true
-chat:
-  auto_reply: true
 knowledge_base:
+  opt_out: false
   learnings:
     scope: auto
-  jira:
-    project_keys: []
-  linear:
-    team_keys: []
   issues:
     scope: auto
   pull_requests:
     scope: auto
-  file_context:
-    filePatterns:
-      - "REVIEW.md"
-      - "AGENTS.md"
+chat:
+  auto_reply: true
