@@ -147,6 +147,34 @@ make catalog-push CATALOG_IMG=<img>   # Push catalog image
 3. **Editing generated files**: Files matching `zz_generated*` and `config/crd/bases/*.yaml` are overwritten by `make generate` / `make manifests`. Changes will be lost.
 4. **Running E2E without deployed operator**: E2E tests require the operator running in a cluster. Set `KUBECONFIG` and `NAMESPACE` before running `make e2e`.
 5. **Assuming namespace exclusions**: Only `kube-*` and the operator namespace are hardcoded. Without a `namespaceSelector`, the webhook gates pods in `openshift-*` namespaces, which can block critical workloads.
+6. **Using `r.Get()` when deletion timing matters**: The informer cache can return stale objects missing `DeletionTimestamp`. Use `r.APIReader.Get()` for direct API server reads when delete-order correctness is required. This was the root cause of [MULTIARCH-6269](https://issues.redhat.com/browse/MULTIARCH-6269) and [MULTIARCH-6239](https://issues.redhat.com/browse/MULTIARCH-6239).
+7. **Not filtering attestation manifests during image inspection**: OCI image indexes may contain attestation manifests with `platform.architecture: "unknown"`. Always validate that platform entries represent real architectures before including them in nodeAffinity. Fixed in [MULTIARCH-5800](https://issues.redhat.com/browse/MULTIARCH-5800).
+8. **ServicePortsMatch positional comparison**: When adding or reordering Service ports in operand resource builders, be aware that the port comparison in `resourcemerge` uses positional (index-based) matching rather than name-keyed lookup ([MULTIARCH-6309](https://issues.redhat.com/browse/MULTIARCH-6309)). This can cause unnecessary resource updates.
+
+## Debugging Tips
+
+> **Source**: Patterns from Jira bug reports and #forum-ocp-testplatform Slack threads.
+
+### Pods stuck in SchedulingGated state
+If pods remain gated, check:
+1. MTO controller pod is running: `oc get pods -n openshift-multiarch-tuning-operator`
+2. Controller logs for image inspection errors: `oc logs -n openshift-multiarch-tuning-operator deploy/multiarch-tuning-operator-controller`
+3. Manual gate removal (emergency workaround): `kubectl patch pod <name> --type=json -p '[{"op":"remove","path":"/spec/schedulingGates/0"}]'`
+
+### CPPC deletion stuck with finalizer
+If a ClusterPodPlacementConfig has `DeletionTimestamp` but is not being cleaned up:
+1. Check controller logs for reconcile errors
+2. This may indicate the informer cache race ([MULTIARCH-6269](https://issues.redhat.com/browse/MULTIARCH-6269)) — fixed in v1.3.4
+3. Manual finalizer removal (last resort): `kubectl patch cppc cluster --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'`
+
+### Image inspection returns "unknown" architecture
+If pods get nodeAffinity for architecture "unknown":
+1. Inspect the image manifest: `skopeo inspect --raw docker://<image>`
+2. Look for attestation manifests with `platform.architecture: "unknown"` — fixed in v1.3 ([MULTIARCH-5800](https://issues.redhat.com/browse/MULTIARCH-5800))
+3. Ensure you're running MTO v1.3+ which filters out attestation manifests
+
+### E2E test "Should cleanup all finalizers" is flaky
+This test creates and immediately deletes a CPPC, which races with the controller's finalizer injection. The root cause is tracked in [MULTIARCH-6240](https://issues.redhat.com/browse/MULTIARCH-6240) (open — switch to mutating webhook for finalizer injection).
 
 ## Lint and Quality
 
@@ -159,6 +187,22 @@ make fmt        # gofmt formatting
 ```
 
 All checks run automatically as part of `make test`.
+
+## Active Development Areas
+
+> **Source**: Jira project MULTIARCH, 2026-09-25.
+
+| Area | Jira | Status |
+|------|------|--------|
+| Network policies for MTO | [MULTIARCH-5569](https://issues.redhat.com/browse/MULTIARCH-5569) | In Progress |
+| Per-branch catalog build in Prow | [MULTIARCH-5537](https://issues.redhat.com/browse/MULTIARCH-5537) | In Progress |
+| Code coverage investigation | [MULTIARCH-6003](https://issues.redhat.com/browse/MULTIARCH-6003) | In Progress |
+| Migrate deprecated events API | [MULTIARCH-6087](https://issues.redhat.com/browse/MULTIARCH-6087) | To Do |
+| Migrate to UBI10 | [MULTIARCH-6199](https://issues.redhat.com/browse/MULTIARCH-6199) | To Do |
+| Finalizer via mutating webhook | [MULTIARCH-6240](https://issues.redhat.com/browse/MULTIARCH-6240) | To Do |
+| PPC plugins field optional | [MULTIARCH-6340](https://issues.redhat.com/browse/MULTIARCH-6340) | To Do |
+| Image volumes handling | [MULTIARCH-4984](https://issues.redhat.com/browse/MULTIARCH-4984) | To Do |
+| Auto-create default CPPC with PPC | [MULTIARCH-5322](https://issues.redhat.com/browse/MULTIARCH-5322) | To Do |
 
 ## SME Review Recommended
 

@@ -10,6 +10,8 @@
 3. **NEVER** assume `openshift-*` namespaces are excluded from pod placement -- only `kube-*` and the operator namespace are hardcoded; others require `namespaceSelector` on the CR
 4. **NEVER** build without CGO — the `containers/image` library requires `gpgme-devel` (RHEL) or `libgpgme-dev` (Debian)
 5. **NEVER** mix `resourceapply` (RBAC, webhooks) with `controller-runtime` Update (CR status, finalizers) — see ARCHITECTURE.md §Resource Management
+6. **NEVER** use `r.Get()` (informer cache) when deletion timing is critical — use `r.APIReader.Get()` instead. The informer cache can return stale objects missing `DeletionTimestamp`, causing the controller to follow the wrong reconcile path. See [MULTIARCH-6269](https://issues.redhat.com/browse/MULTIARCH-6269).
+7. **NEVER** include attestation manifests in architecture detection — OCI image indexes can contain entries with `platform.architecture: "unknown"` that are attestation artifacts, not real platform entries. Always filter these during image inspection. See [MULTIARCH-5800](https://issues.redhat.com/browse/MULTIARCH-5800).
 
 ## Architecture at a Glance
 

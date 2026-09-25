@@ -209,6 +209,71 @@ For generic OpenShift development patterns, refer to the [openshift/enhancements
 - Enhancement process: [`guidelines/`](https://github.com/openshift/enhancements/tree/master/guidelines)
 - Coding standards: [`CONVENTIONS.md`](https://github.com/openshift/enhancements/blob/master/CONVENTIONS.md)
 
+## Known Issues & Operational Gotchas
+
+> **Source**: Jira project MULTIARCH (component: Multiarch-Tuning-Operator) and Slack discussions from #forum-ocp-testplatform. Verified 2026-09-25.
+
+### Active / Open Issues
+
+| Jira | Summary | Impact |
+|------|---------|--------|
+| [MULTIARCH-6240](https://issues.redhat.com/browse/MULTIARCH-6240) | **Finalizer injection race condition** — The controller adds the `pod-placement` finalizer asynchronously during reconciliation. If a CPPC is deleted before the controller processes the create event, the object is deleted immediately with no cleanup, leaving orphaned operand resources (Deployments, RBAC, ServiceMonitor). **Proposed fix**: switch to a mutating admission webhook that injects the finalizer at creation time. The existing controller logic would remain as a fallback. | Affects rapid create/delete scenarios, GitOps reconciliation loops, and flaky E2E test "Should cleanup all finalizers" |
+| [MULTIARCH-5569](https://issues.redhat.com/browse/MULTIARCH-5569) | **Network policies not implemented** — MTO does not currently deploy NetworkPolicy resources, leaving operand pods without network-level isolation. | Security hardening gap |
+| [MULTIARCH-6087](https://issues.redhat.com/browse/MULTIARCH-6087) | **Deprecated events API** — MTO uses the legacy events API; migration to the new `events.k8s.io/v1` API is tracked. | Future deprecation risk |
+| [MULTIARCH-6199](https://issues.redhat.com/browse/MULTIARCH-6199) | **UBI10 migration** — Container base images need migration from UBI9 to UBI10. | Build infrastructure modernization |
+| [MULTIARCH-4984](https://issues.redhat.com/browse/MULTIARCH-4984) | **Image volumes handling** — Open question on how MTO should handle Kubernetes image volumes (a K8s 1.31+ feature). | Future feature gap |
+| [MULTIARCH-6309](https://issues.redhat.com/browse/MULTIARCH-6309) | **ServicePortsMatch uses positional comparison** — Port comparison during resource apply uses index-based matching instead of name-keyed lookup, which can cause unnecessary resource updates. | Minor correctness issue |
+
+### Recently Fixed Issues (Tribal Knowledge)
+
+These bugs are fixed but document important behavioral patterns developers should understand:
+
+| Jira | Summary | Fix Version | Root Cause & Lesson |
+|------|---------|-------------|---------------------|
+| [MULTIARCH-6269](https://issues.redhat.com/browse/MULTIARCH-6269) | CPPC deletion stuck due to informer cache race | v1.3.4 | The controller read CPPC via `r.Get()` (informer cache), which returned stale data without `DeletionTimestamp`. **Fix**: Use `r.APIReader.Get()` (direct API server read) at the top of `Reconcile` to always see the latest object state. **Lesson**: When deletion timing matters, prefer `APIReader` over the cached client. |
+| [MULTIARCH-6239](https://issues.redhat.com/browse/MULTIARCH-6239) | PPC preferred affinity missed when informer cache is stale | — | Image inspection completed before the informer cache synced the PodPlacementConfig, causing preferred affinity terms to be skipped. **Lesson**: Same informer staleness pattern as MULTIARCH-6269. |
+| [MULTIARCH-5800](https://issues.redhat.com/browse/MULTIARCH-5800) | Images with attestation manifests cause "unknown" architecture | v1.3 | OCI image indexes can contain attestation manifests with `platform.architecture: "unknown"`. MTO included these in the supported architecture set, resulting in `nodeAffinity` for architecture "unknown". **Fix**: Filter out attestation manifests during image inspection. **Lesson**: Always validate platform entries in manifest lists — not all entries represent real architectures. |
+| [MULTIARCH-5764](https://issues.redhat.com/browse/MULTIARCH-5764) | Short image names fail inspection on OCP 4.21 | v1.3 | Kubelet on OCP 4.21 changed how short image names are resolved. MTO's image inspection did not account for this, causing failures when images used short names without a registry prefix. |
+| [MULTIARCH-6270](https://issues.redhat.com/browse/MULTIARCH-6270) | enoexec-event-daemon DaemonSet fails in kustomize deployments | v1.3.4 | ServiceAccount pull secret race condition during startup. |
+| [MULTIARCH-6271](https://issues.redhat.com/browse/MULTIARCH-6271) | OLM CSV lifecycle cycling on OCP 4.16 | v1.3.4 | OLM cycling prevented operator convergence and blocked CPPC finalizer processing. |
+| [MULTIARCH-6236](https://issues.redhat.com/browse/MULTIARCH-6236) | CPPC deletion tears down operands before checking for PPC | — | Deletion order matters: operand resources were removed before checking if PodPlacementConfig objects still existed, causing orphaned PPC state. |
+| [MULTIARCH-6207](https://issues.redhat.com/browse/MULTIARCH-6207) | eNoExecEvent daemon status update conflict race | — | Daemon and handler controller both update the same ENoExecEvent CR status, causing frequent conflict errors. |
+
+### Common CI/Operational Issues (from Slack)
+
+These patterns appear repeatedly in `#forum-ocp-testplatform` Slack discussions:
+
+1. **Scheduling gate cycling**: Pods can appear to be gated, ungated, then re-gated in quick succession. This typically indicates the operator was restarted or the webhook was temporarily unavailable. Check operator pod logs for restart events.
+
+2. **Image inspection failures with "manifest unknown"**: When the internal OpenShift image registry (`image-registry.svc:5000`) returns "manifest unknown", MTO cannot determine the image architecture. This usually indicates the image hasn't been fully imported yet. The `fallbackArchitecture` field on CPPC can mitigate this.
+
+3. **Pods stuck in SchedulingGated state**: If the MTO controller pod is down or overloaded, pods remain gated indefinitely. The scheduling gate can be manually removed from individual pods as a workaround: `kubectl patch pod <name> --type=json -p '[{"op":"remove","path":"/spec/schedulingGates/0"}]'`
+
+4. **CI multi-arch payload failures**: In OpenShift CI, architecture-specific image variants may be absent from the payload, causing MTO to set incorrect architecture constraints. Check that all container images in the pod spec have the expected architecture variants published.
+
+5. **Short image name resolution**: On OCP 4.21+, ensure images use fully qualified names (including registry) to avoid inspection failures. This was fixed in MTO v1.3 ([MULTIARCH-5764](https://issues.redhat.com/browse/MULTIARCH-5764)).
+
+## Design References — Upstream KEP Details
+
+> **Source**: Verified from `kubernetes/enhancements` repository, 2026-09-25.
+
+### KEP-3521: Pod Scheduling Readiness (Stable since K8s 1.30)
+
+The scheduling gate mechanism (`.spec.schedulingGates`) is the foundation of MTO's approach. Key details from the upstream KEP:
+
+- **State transition**: `schedulingGates` can only be set at pod creation (by client or mutating webhooks). After creation, gates can only be _removed_, never added. This is why MTO uses a mutating webhook to add the gate at admission time.
+- **Restricted state**: A pod with `spec.nodeName` set cannot have scheduling gates (enforced by API server validation). This is why MTO skips pods with `spec.nodeName` already set.
+- **Metric**: `scheduler_pending_pods{queue="gated"}` tracks the number of gated pods in the scheduler's queue.
+- **Feature gate**: `PodSchedulingReadiness` — enabled by default since K8s 1.27 (beta), locked to enabled since K8s 1.30 (GA). Cannot be disabled in 1.30+.
+
+### KEP-3838: Pod Mutable Scheduling Directives (Stable since K8s 1.30)
+
+This KEP is what allows MTO to modify `nodeAffinity` on gated pods after creation:
+
+- **Scope**: While a pod is gated (has any `schedulingGate`), its `nodeAffinity`, `nodeSelector`, and `tolerations` can be mutated. Once all gates are removed and the pod enters scheduling, these fields become immutable again.
+- **Dependency**: Relies on KEP-3521's scheduling gates. Same feature gate (`PodSchedulingReadiness`).
+- **Related**: KEP-2926 (Job Mutable Scheduling Directives) extends similar mutability to Job-owned pods.
+
 ## SME Review Recommended
 
 - Exact ICSP/IDMS/ITMS interaction with image inspection (noted as TODO in `pkg/image/inspector.go:92`)
